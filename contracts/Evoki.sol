@@ -2,7 +2,6 @@
 pragma solidity ^0.8.4;
 
 import "./abstracts/BaseContract.sol";
-import "./interfaces/IDividendDistributor.sol";
 import "@openzeppelin/contracts/utils/math/SafeMath.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
 import "@uniswap/v2-core/contracts/interfaces/IUniswapV2Factory.sol";
@@ -18,15 +17,26 @@ contract Evoki is BaseContract, ERC20Upgradeable {
     // is necessary to receive unused bnb from the swaprouter
     receive() external payable {}
 
+    using SafeMath for uint256;
+
+    uint256 public constant DECIMALS = 8;
+    uint256 public constant MAX_UINT = 1e40;
+    uint8 public constant RATE_DECIMALS = 7;
+
+    uint256 private constant INITIAL_FRAGMENTS_SUPPLY = 88000000 * 10**DECIMALS;
+    uint256 private constant TOTAL_GONS =
+        MAX_UINT - (MAX_UINT % INITIAL_FRAGMENTS_SUPPLY);
+    uint256 private constant MAX_SUPPLY = 888888888 * 10**DECIMALS;
+
     /**
      * Contract initializer.
      * @dev This intializes all the parent contracts.
      */
     function initialize(
         address router_,
+        address treasury_,
         address liquidityFeeReceiver_,
-        address growthFundFeeReceiver_,
-        address reflectionFeeReceiver_
+        address growthFundFeeReceiver_
     ) public initializer {
         __BaseContract_init();
         __ERC20_init("Evoki", "EVOKI");
@@ -42,34 +52,23 @@ contract Evoki is BaseContract, ERC20Upgradeable {
 
         liquidityFeeReceiver = liquidityFeeReceiver_;
         growthFundFeeReceiver = growthFundFeeReceiver_;
-        reflectionFeeReceiver = reflectionFeeReceiver_;
+        treasury = treasury_;
 
         _allowedFragments[address(this)][address(router)] = ~uint256(0);
-        _allowedFragments[address(this)][reflectionFeeReceiver] = ~uint256(0);
 
-        distributor = IDividendDistributor(reflectionFeeReceiver);
         pairContract = IUniswapV2Pair(pair);
 
         _totalSupply = INITIAL_FRAGMENTS_SUPPLY;
-        _gonBalances[msg.sender] = TOTAL_GONS;
+        _gonBalances[treasury] = TOTAL_GONS;
         _gonsPerFragment = TOTAL_GONS.div(_totalSupply);
-        _lastRebasedTime = block.timestamp;
         _autoRebase = false;
         _autoAddLiquidity = true;
         inAddLiquidity = false;
 
-        _isFeeExempt[msg.sender] = true;
-        _isFeeExempt[address(this)] = true;
-        _isFeeExempt[liquidityFeeReceiver] = true;
-        _isFeeExempt[growthFundFeeReceiver] = true;
-        _isFeeExempt[reflectionFeeReceiver] = true;
-
-
         isDividendExempt[pair] = true;
-        isDividendExempt[msg.sender] = true;
+        isDividendExempt[treasury] = true;
         isDividendExempt[liquidityFeeReceiver] = true;
         isDividendExempt[growthFundFeeReceiver] = true;
-        isDividendExempt[reflectionFeeReceiver] = true;
         isDividendExempt[address(this)] = true;
         isDividendExempt[address(0)] = true;
 
@@ -79,23 +78,14 @@ contract Evoki is BaseContract, ERC20Upgradeable {
         totalFee = liquidityFee.add(growthFundFee).add(reflectionFee);
         feeDenominator = 1000;
 
-        emit Transfer(address(0x0), msg.sender, _totalSupply);
+        dividendsPerShareAccuracyFactor = 1e8;
+
+        emit Transfer(address(0x0), treasury, _totalSupply);
     }
 
     function decimals() public view virtual override returns (uint8) {
         return 8;
     }
-
-    using SafeMath for uint256;
-
-    uint256 public constant DECIMALS = 8;
-    uint256 public constant MAX_UINT256 = ~uint256(0);
-    uint8 public constant RATE_DECIMALS = 7;
-
-    uint256 private constant INITIAL_FRAGMENTS_SUPPLY = 88000000 * 10**DECIMALS;
-    uint256 private constant TOTAL_GONS =
-        MAX_UINT256 - (MAX_UINT256 % INITIAL_FRAGMENTS_SUPPLY);
-    uint256 private constant MAX_SUPPLY = 888888888 * 10**DECIMALS;
 
     uint256 public liquidityFee;
     uint256 public growthFundFee;
@@ -105,7 +95,7 @@ contract Evoki is BaseContract, ERC20Upgradeable {
 
     address public liquidityFeeReceiver;
     address public growthFundFeeReceiver;
-    address public reflectionFeeReceiver;
+    address public treasury;
 
     IUniswapV2Router02 public router;
     IUniswapV2Pair public pairContract;
@@ -128,22 +118,49 @@ contract Evoki is BaseContract, ERC20Upgradeable {
     uint256 public _lastAddLiquidityTime;
     uint256 public _totalSupply;
     uint256 private _gonsPerFragment;
+
+    uint256 public totalBurnAmount;
+    uint256 public totalReflectionAmount;
+
+    //to calculate APY
+    uint256 public lastReflectonAmount;
+    uint256 public lastReflectionDuration;
+    uint256 public lastReflectionCall;
+
     mapping(address => uint256) private _gonBalances;
     mapping(address => mapping(address => uint256)) private _allowedFragments;
-    mapping(address => bool) _isFeeExempt;
     mapping(address => bool) public blacklist;
-    mapping (address => bool) isDividendExempt;
+    mapping(address => bool) isDividendExempt;
 
-    IDividendDistributor distributor;
+    //For Reflecition
+    struct Share {
+        uint256 gonAmount;
+        uint256 totalExcluded;
+        uint256 totalRealised;
+    }
 
+    address[] shareholders;
+    mapping(address => uint256) shareholderIndexes;
+    mapping(address => uint256) totalRewardsDistributed;
+    mapping(address => Share) shares;
+
+    uint256 totalShares;
+    uint256 dividendsPerShare;
+    uint256 dividendsPerShareAccuracyFactor;
+
+    /**
+        Event
+     */
     event LogRebase(uint256 indexed epoch, uint256 totalSupply);
 
-    function rebase() internal {
+    function _rebase() internal {
         if (inAddLiquidity) return;
         uint256 deltaTime = block.timestamp - _lastRebasedTime;
         uint256 times = deltaTime.div(10 minutes);
         uint256 epoch = times.mul(10);
-        _totalSupply = _totalSupply.add(times.mul(340752).div(100).mul(10**DECIMALS));
+        _totalSupply = _totalSupply.add(
+            times.mul(304752).div(100).mul(10**DECIMALS)
+        );
 
         _gonsPerFragment = TOTAL_GONS.div(_totalSupply);
         _lastRebasedTime = _lastRebasedTime.add(times.mul(10 minutes));
@@ -198,67 +215,105 @@ contract Evoki is BaseContract, ERC20Upgradeable {
         require(recipient != address(0), "Invalid address");
         require(!blacklist[sender] && !blacklist[recipient], "in_blacklist");
 
-
-        if (shouldRebase()) {
-            rebase();
+        if (_shouldRebase()) {
+            _rebase();
         }
 
-        if (shouldAddLiquidity()) {
-            addLiquidity();
+        if (_shouldAddLiquidity()) {
+            _addLiquidity();
         }
 
         if (inAddLiquidity) {
             return _basicTransfer(sender, recipient, amount);
         }
 
+        if (sender == treasury || recipient == treasury) {
+            return _basicTransfer(sender, recipient, amount);
+        }
+
         uint256 gonAmount = amount.mul(_gonsPerFragment);
         _gonBalances[sender] = _gonBalances[sender].sub(gonAmount);
-        uint256 gonAmountReceived = shouldTakeFee(sender, recipient)
-            ? takeFee(sender, gonAmount)
+        uint256 gonAmountReceived = _shouldTakeFee(sender, recipient)
+            ? _takeFee(sender, gonAmount)
             : gonAmount;
-        _gonBalances[recipient] = _gonBalances[recipient].add(
-            gonAmountReceived
+        _gonBalances[recipient] = _gonBalances[recipient].add(gonAmountReceived);
+
+        if (!isDividendExempt[sender])
+            _setShare(sender, _gonBalances[sender]);
+        if (!isDividendExempt[recipient])
+            _setShare(recipient, _gonBalances[recipient]);
+
+        if (recipient == pair) {
+            _burn(amount.mul(20).div(100));
+            totalBurnAmount = totalBurnAmount.add(amount.mul(20).div(100));
+        }
+
+        emit Transfer(
+            sender,
+            recipient,
+            gonAmountReceived.div(_gonsPerFragment)
         );
-
-        if(!isDividendExempt[sender]){ try distributor.setShare(sender, (_gonBalances[sender].sub(gonAmount)).div(_gonsPerFragment)) {} catch {} }
-        if(!isDividendExempt[recipient]){ try distributor.setShare(recipient, (_gonBalances[recipient].add(gonAmountReceived)).div(_gonsPerFragment)) {} catch {} }
-
-        if(recipient == pair) burn(amount.mul(20).div(100));
-
-        emit Transfer(sender, recipient, gonAmountReceived.div(_gonsPerFragment));
         return true;
     }
 
-    function burn(uint256 amount) internal {
+    function _burn(uint256 amount) internal {
         _totalSupply = _totalSupply.sub(amount);
+        _gonsPerFragment = TOTAL_GONS.div(_totalSupply);
+
     }
 
-    function takeFee(
-        address sender,
-        uint256 gonAmount
-    ) internal returns (uint256) {
- 
+    function _takeFee(address sender, uint256 gonAmount)
+        internal
+        returns (uint256)
+    {
         uint256 feeAmount = gonAmount.div(feeDenominator).mul(totalFee);
 
         _gonBalances[liquidityFeeReceiver] = _gonBalances[liquidityFeeReceiver]
             .add(gonAmount.div(feeDenominator).mul(liquidityFee));
 
-        _gonBalances[growthFundFeeReceiver] = _gonBalances[growthFundFeeReceiver]
-            .add(gonAmount.div(feeDenominator).mul(growthFundFee));
-        
-        _gonBalances[reflectionFeeReceiver] = _gonBalances[reflectionFeeReceiver]
-            .add(gonAmount.div(feeDenominator).mul(reflectionFee));
-        uint256 reflectionAmount = gonAmount.div(feeDenominator).mul(reflectionFee).div(_gonsPerFragment);
-        distributor.deposit(reflectionAmount);
+        _gonBalances[growthFundFeeReceiver] = _gonBalances[
+            growthFundFeeReceiver
+        ].add(gonAmount.div(feeDenominator).mul(growthFundFee));
 
-        emit Transfer(sender, liquidityFeeReceiver, gonAmount.div(feeDenominator).mul(liquidityFee).div(_gonsPerFragment));
-        emit Transfer(sender, growthFundFeeReceiver, gonAmount.div(feeDenominator).mul(growthFundFee).div(_gonsPerFragment));
-        emit Transfer(sender, reflectionFeeReceiver, gonAmount.div(feeDenominator).mul(reflectionFee).div(_gonsPerFragment));
+        uint256 _gonAmountForReflction_ = gonAmount.div(feeDenominator).mul(reflectionFee);
+        _gonBalances[address(this)] = _gonBalances[address(this)].add(
+            _gonAmountForReflction_
+        );
+
+        totalReflectionAmount = totalReflectionAmount.add(_gonAmountForReflction_.div(_gonsPerFragment));
+        updateDivendensPerShare(_gonAmountForReflction_);
+
+        //Store reflection rewards to calcualte APY
+        lastReflectonAmount = _gonAmountForReflction_.div(_gonsPerFragment);
+        lastReflectionDuration = block.timestamp - lastReflectionCall;
+        lastReflectionCall = block.timestamp;
+
+        emit Transfer(
+            sender,
+            liquidityFeeReceiver,
+            gonAmount.div(feeDenominator).mul(liquidityFee).div(
+                _gonsPerFragment
+            )
+        );
+        emit Transfer(
+            sender,
+            growthFundFeeReceiver,
+            gonAmount.div(feeDenominator).mul(growthFundFee).div(
+                _gonsPerFragment
+            )
+        );
+        emit Transfer(
+            sender,
+            address(this),
+            gonAmount.div(feeDenominator).mul(reflectionFee).div(
+                _gonsPerFragment
+            )
+        );
 
         return gonAmount.sub(feeAmount);
     }
 
-    function addLiquidity() internal addingLiquidity {
+    function _addLiquidity() internal addingLiquidity {
         uint256 autoLiquidityAmount = _gonBalances[liquidityFeeReceiver].div(
             _gonsPerFragment
         );
@@ -290,33 +345,29 @@ contract Evoki is BaseContract, ERC20Upgradeable {
         uint256 amountETHLiquidity = address(this).balance.sub(balanceBefore);
 
         if (amountToLiquify > 0 && amountETHLiquidity > 0) {
-            (, uint256 usedEth,) = router
-                .addLiquidityETH{value: amountETHLiquidity}(
-                    address(this),
-                    amountToLiquify,
-                    0,
-                    0,
-                    liquidityFeeReceiver,
-                    block.timestamp + 1
-                );
-            uint256 unusedEth = amountETHLiquidity - usedEth;
-            // send back unused BNB
-            (bool transferSuccess, ) = payable(msg.sender).call{value: unusedEth}("");
-            require(transferSuccess, "TF");
-
+            router.addLiquidityETH{
+                value: amountETHLiquidity
+            }(
+                address(this),
+                amountToLiquify,
+                0,
+                0,
+                liquidityFeeReceiver,
+                block.timestamp + 1
+            );
         }
         _lastAddLiquidityTime = block.timestamp;
     }
 
-    function shouldTakeFee(address from, address to)
+    function _shouldTakeFee(address from, address to)
         internal
         view
         returns (bool)
     {
-        return (pair == from || pair == to) && !_isFeeExempt[from];
+        return ((pair == from || pair == to));
     }
 
-    function shouldRebase() internal view returns (bool) {
+    function _shouldRebase() internal view returns (bool) {
         return
             _autoRebase &&
             (_totalSupply < MAX_SUPPLY) &&
@@ -325,7 +376,7 @@ contract Evoki is BaseContract, ERC20Upgradeable {
             block.timestamp >= (_lastRebasedTime + 10 minutes);
     }
 
-    function shouldAddLiquidity() internal view returns (bool) {
+    function _shouldAddLiquidity() internal view returns (bool) {
         return
             _autoAddLiquidity &&
             !inAddLiquidity &&
@@ -407,16 +458,9 @@ contract Evoki is BaseContract, ERC20Upgradeable {
         return true;
     }
 
-    function checkFeeExempt(address _addr) external view returns (bool) {
-        return _isFeeExempt[_addr];
+    function getCirculatingSupply() public view returns (uint256) {
+        return (TOTAL_GONS.sub(_gonBalances[address(0)])).div(_gonsPerFragment);
     }
-
-    // function getCirculatingSupply() public view returns (uint256) {
-    //     return
-    //         (TOTAL_GONS.sub(_gonBalances[address(0)])).div(
-    //             _gonsPerFragment
-    //         );
-    // }
 
     function isNotInAddLiquidity() external view returns (bool) {
         return !inAddLiquidity;
@@ -434,16 +478,11 @@ contract Evoki is BaseContract, ERC20Upgradeable {
         growthFundFeeReceiver = _growthFundFeeReceiver;
     }
 
-    function setDistributor(address reflectionFeeReceiver_) public onlyOwner {
-        reflectionFeeReceiver = reflectionFeeReceiver_;
-        distributor = IDividendDistributor(reflectionFeeReceiver);
-    }
-
     function setPairAddress(address pair_) public onlyOwner {
         pair = pair_;
     }
 
-    function setLP(address _address) external onlyOwner {
+    function setPairContract(address _address) external onlyOwner {
         pairContract = IUniswapV2Pair(_address);
     }
 
@@ -455,35 +494,162 @@ contract Evoki is BaseContract, ERC20Upgradeable {
         return _gonBalances[who].div(_gonsPerFragment);
     }
 
-    function setWhitelist(address _addr) external onlyOwner {
-        _isFeeExempt[_addr] = true;
-    }
-
-    function setBotBlacklist(address _botAddress, bool _flag) public onlyOwner {
-        require(isContract(_botAddress), "only contract address, not allowed exteranlly owned account");
-        blacklist[_botAddress] = _flag;    
+    function setBotBlacklist(address _Address, bool _flag) public onlyOwner {
+        blacklist[_Address] = _flag;
     }
 
     function isContract(address addr) public view returns (bool) {
-        uint size;
-        assembly { size := extcodesize(addr) }
+        uint256 size;
+        assembly {
+            size := extcodesize(addr)
+        }
         return size > 0;
     }
 
-    function setIsDividendExempt(address holder, bool exempt) external onlyOwner {
+    function setIsDividendExempt(address holder, bool exempt)
+        external
+        onlyOwner
+    {
         require(holder != address(this) && holder != pair);
         isDividendExempt[holder] = exempt;
-        if(exempt){
-            distributor.setShare(holder, 0);
-        }else{
-            distributor.setShare(holder, _gonBalances[holder].div(_gonsPerFragment));
+        if (exempt) {
+            _setShare(holder, 0);
+        } else {
+            _setShare(holder, _gonBalances[holder]);
         }
     }
 
+    function getHoldersNum() public view returns (uint256) {
+        return shareholders.length;
+    }
+
+    /**
+        For reflection
+     */
+    function _setShare(address shareholder, uint256 gonAmount) internal {
+        if (shares[shareholder].gonAmount > 0) {
+            distributeDividend(shareholder);
+        }
+
+        if (gonAmount > 0 && shares[shareholder].gonAmount == 0) {
+            addShareholder(shareholder);
+        } else if (gonAmount == 0 && shares[shareholder].gonAmount > 0) {
+            removeShareholder(shareholder);
+        }
+
+        totalShares = totalShares.add(gonAmount).sub(
+            shares[shareholder].gonAmount
+        );
+        shares[shareholder].gonAmount = gonAmount;
+        shares[shareholder].totalExcluded = getCumulativeDividends(
+            shares[shareholder].gonAmount
+        );
+    }
+
+    function updateDivendensPerShare(uint256 gonAmount) internal {
+        if (totalShares == 0) return;
+        dividendsPerShare = dividendsPerShare.add(
+            dividendsPerShareAccuracyFactor.mul(gonAmount).div(totalShares)
+        );
+    }
+
+    function distributeDividend(address shareholder) internal {
+        if (shares[shareholder].gonAmount == 0) {
+            return;
+        }
+
+        uint256 gonAmount = getUnpaidEarnings(shareholder).mul(
+            _gonsPerFragment
+        );
+
+        if (gonAmount > 0) {
+            _gonBalances[address(this)] = _gonBalances[address(this)].sub(
+                gonAmount
+            );
+            _gonBalances[shareholder] = _gonBalances[shareholder].add(
+                gonAmount
+            );
+
+            shares[shareholder].totalRealised = shares[shareholder]
+                .totalRealised
+                .add(gonAmount);
+            shares[shareholder].totalExcluded = getCumulativeDividends(
+                shares[shareholder].gonAmount
+            );
+        }
+
+        emit Transfer(
+            address(this),
+            shareholder,
+            gonAmount.div(_gonsPerFragment)
+        );
+    }
+
+    function claimDividend() external {
+        distributeDividend(msg.sender);
+    }
+
+    /**
+        @dev this funtion returns token amount - not gons amount!
+     */
+    function getUnpaidEarnings(address shareholder)
+        public
+        view
+        returns (uint256)
+    {
+        if (shares[shareholder].gonAmount == 0) {
+            return 0;
+        }
+
+        uint256 shareholderTotalDividends = getCumulativeDividends(
+            shares[shareholder].gonAmount
+        );
+        uint256 shareholderTotalExcluded = shares[shareholder].totalExcluded;
+
+        if (shareholderTotalDividends <= shareholderTotalExcluded) {
+            return 0;
+        }
+
+        return
+            (shareholderTotalDividends.sub(shareholderTotalExcluded)).div(
+                _gonsPerFragment
+            );
+    }
+
+    function getCumulativeDividends(uint256 share)
+        internal
+        view
+        returns (uint256)
+    {
+        return
+            share.mul(dividendsPerShare).div(dividendsPerShareAccuracyFactor);
+    }
+
+    function addShareholder(address shareholder) internal {
+        shareholderIndexes[shareholder] = shareholders.length;
+        shareholders.push(shareholder);
+    }
+
+    function removeShareholder(address shareholder) internal {
+        shareholders[shareholderIndexes[shareholder]] = shareholders[
+            shareholders.length - 1
+        ];
+        shareholderIndexes[
+            shareholders[shareholders.length - 1]
+        ] = shareholderIndexes[shareholder];
+        shareholders.pop();
+    }
+
     function withdraw() external onlyOwner {
-        _gonBalances[msg.sender] = _gonBalances[msg.sender].add(_gonBalances[address(this)]);
+        _gonBalances[msg.sender] = _gonBalances[msg.sender].add(
+            _gonBalances[address(this)]
+        );
         _gonBalances[address(this)] = 0;
 
-        emit Transfer(address(this), msg.sender, _gonBalances[address(this)].div(_gonsPerFragment));
+        emit Transfer(
+            address(this),
+            msg.sender,
+            _gonBalances[address(this)].div(_gonsPerFragment)
+        );
     }
 }
